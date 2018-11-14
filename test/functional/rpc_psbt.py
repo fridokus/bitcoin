@@ -146,6 +146,9 @@ class PSBTTest(BitcoinTestFramework):
         # Make sure that a psbt with signatures cannot be converted
         signedtx = self.nodes[0].signrawtransactionwithwallet(rawtx['hex'])
         assert_raises_rpc_error(-22, "TX decode failed", self.nodes[0].converttopsbt, signedtx['hex'])
+        assert_raises_rpc_error(-22, "TX decode failed", self.nodes[0].converttopsbt, signedtx['hex'], False)
+        # Unless we allow it to convert and strip signatures
+        self.nodes[0].converttopsbt(signedtx['hex'], True)
 
         # Explicitly allow converting non-empty txs
         new_psbt = self.nodes[0].converttopsbt(rawtx['hex'])
@@ -207,6 +210,13 @@ class PSBTTest(BitcoinTestFramework):
             assert tx_in["sequence"] > MAX_BIP125_RBF_SEQUENCE
         assert_equal(decoded_psbt["tx"]["locktime"], 0)
 
+        # Regression test for 14473 (mishandling of already-signed witness transaction):
+        psbtx_info = self.nodes[0].walletcreatefundedpsbt([{"txid":unspent["txid"], "vout":unspent["vout"]}], [{self.nodes[2].getnewaddress():unspent["amount"]+1}])
+        complete_psbt = self.nodes[0].walletprocesspsbt(psbtx_info["psbt"])
+        double_processed_psbt = self.nodes[0].walletprocesspsbt(complete_psbt["psbt"])
+        assert_equal(complete_psbt, double_processed_psbt)
+        # We don't care about the decode result, but decoding must succeed.
+        self.nodes[0].decodepsbt(double_processed_psbt["psbt"])
 
         # BIP 174 Test Vectors
 
@@ -269,6 +279,10 @@ class PSBTTest(BitcoinTestFramework):
 
         self.test_utxo_conversion()
 
+        # Test that psbts with p2pkh outputs are created properly
+        p2pkh = self.nodes[0].getnewaddress(address_type='legacy')
+        psbt = self.nodes[1].walletcreatefundedpsbt([], [{p2pkh : 1}], 0, {"includeWatching" : True}, True)
+        self.nodes[0].decodepsbt(psbt['psbt'])
 
 if __name__ == '__main__':
     PSBTTest().main()
