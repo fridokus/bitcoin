@@ -25,12 +25,12 @@ from test_framework.util import (
     assert_raises_rpc_error,
     bytes_to_hex_str as b2x,
 )
-
+from test_framework.script import CScriptNum
 
 def assert_template(node, block, expect, rehash=True):
     if rehash:
         block.hashMerkleRoot = block.calc_merkle_root()
-    rsp = node.getblocktemplate(template_request={'data': b2x(block.serialize()), 'mode': 'proposal'})
+    rsp = node.getblocktemplate(template_request={'data': b2x(block.serialize()), 'mode': 'proposal', 'rules': ['segwit']})
     assert_equal(rsp, expect)
 
 
@@ -60,15 +60,23 @@ class MiningTest(BitcoinTestFramework):
 
         # Mine a block to leave initial block download
         node.generatetoaddress(1, node.get_deterministic_priv_key().address)
-        tmpl = node.getblocktemplate()
+        tmpl = node.getblocktemplate({'rules': ['segwit']})
         self.log.info("getblocktemplate: Test capability advertised")
         assert 'proposal' in tmpl['capabilities']
         assert 'coinbasetxn' not in tmpl
 
-        coinbase_tx = create_coinbase(height=int(tmpl["height"]) + 1)
+        next_height = int(tmpl["height"])
+        coinbase_tx = create_coinbase(height=next_height)
         # sequence numbers must not be max for nLockTime to have effect
         coinbase_tx.vin[0].nSequence = 2 ** 32 - 2
         coinbase_tx.rehash()
+
+        # round-trip the encoded bip34 block height commitment
+        assert_equal(CScriptNum.decode(coinbase_tx.vin[0].scriptSig), next_height)
+        # round-trip negative and multi-byte CScriptNums to catch python regression
+        assert_equal(CScriptNum.decode(CScriptNum.encode(CScriptNum(1500))), 1500)
+        assert_equal(CScriptNum.decode(CScriptNum.encode(CScriptNum(-1500))), -1500)
+        assert_equal(CScriptNum.decode(CScriptNum.encode(CScriptNum(-1))), -1)
 
         block = CBlock()
         block.nVersion = tmpl["version"]
@@ -77,6 +85,9 @@ class MiningTest(BitcoinTestFramework):
         block.nBits = int(tmpl["bits"], 16)
         block.nNonce = 0
         block.vtx = [coinbase_tx]
+
+        self.log.info("getblocktemplate: segwit rule must be set")
+        assert_raises_rpc_error(-8, "getblocktemplate must be called with the segwit rule set", node.getblocktemplate)
 
         self.log.info("getblocktemplate: Test valid block")
         assert_template(node, block, None)
@@ -94,7 +105,7 @@ class MiningTest(BitcoinTestFramework):
         assert_raises_rpc_error(-22, "Block does not start with a coinbase", node.submitblock, b2x(bad_block.serialize()))
 
         self.log.info("getblocktemplate: Test truncated final transaction")
-        assert_raises_rpc_error(-22, "Block decode failed", node.getblocktemplate, {'data': b2x(block.serialize()[:-1]), 'mode': 'proposal'})
+        assert_raises_rpc_error(-22, "Block decode failed", node.getblocktemplate, {'data': b2x(block.serialize()[:-1]), 'mode': 'proposal', 'rules': ['segwit']})
 
         self.log.info("getblocktemplate: Test duplicate transaction")
         bad_block = copy.deepcopy(block)
@@ -124,7 +135,7 @@ class MiningTest(BitcoinTestFramework):
         bad_block_sn = bytearray(block.serialize())
         assert_equal(bad_block_sn[TX_COUNT_OFFSET], 1)
         bad_block_sn[TX_COUNT_OFFSET] += 1
-        assert_raises_rpc_error(-22, "Block decode failed", node.getblocktemplate, {'data': b2x(bad_block_sn), 'mode': 'proposal'})
+        assert_raises_rpc_error(-22, "Block decode failed", node.getblocktemplate, {'data': b2x(bad_block_sn), 'mode': 'proposal', 'rules': ['segwit']})
 
         self.log.info("getblocktemplate: Test bad bits")
         bad_block = copy.deepcopy(block)

@@ -68,7 +68,7 @@ class TestNode():
         self.rpc_timeout = timewait
         self.binary = bitcoind
         self.coverage_dir = coverage_dir
-        if extra_conf != None:
+        if extra_conf is not None:
             append_config(datadir, extra_conf)
         # Most callers will just need to add extra args to the standard list below.
         # For those callers that need more flexibility, they can just set the args property directly.
@@ -115,7 +115,7 @@ class TestNode():
         ]
         return PRIV_KEYS[self.index]
 
-    def get_mem_rss(self):
+    def get_mem_rss_kilobytes(self):
         """Get the memory usage (RSS) per `ps`.
 
         Returns None if `ps` is unavailable.
@@ -228,13 +228,13 @@ class TestNode():
             wallet_path = "wallet/{}".format(urllib.parse.quote(wallet_name))
             return self.rpc / wallet_path
 
-    def stop_node(self, expected_stderr=''):
+    def stop_node(self, expected_stderr='', wait=0):
         """Stop the node."""
         if not self.running:
             return
         self.log.debug("Stopping node")
         try:
-            self.stop()
+            self.stop(wait=wait)
         except http.client.CannotSendRequest:
             self.log.exception("Unable to stop node.")
 
@@ -291,15 +291,19 @@ class TestNode():
                     self._raise_assertion_error('Expected message "{}" does not partially match log:\n\n{}\n\n'.format(expected_msg, print_log))
 
     @contextlib.contextmanager
-    def assert_memory_usage_stable(self, perc_increase_allowed=0.03):
+    def assert_memory_usage_stable(self, *, increase_allowed=0.03):
         """Context manager that allows the user to assert that a node's memory usage (RSS)
         hasn't increased beyond some threshold percentage.
+
+        Args:
+            increase_allowed (float): the fractional increase in memory allowed until failure;
+                e.g. `0.12` for up to 12% increase allowed.
         """
-        before_memory_usage = self.get_mem_rss()
+        before_memory_usage = self.get_mem_rss_kilobytes()
 
         yield
 
-        after_memory_usage = self.get_mem_rss()
+        after_memory_usage = self.get_mem_rss_kilobytes()
 
         if not (before_memory_usage and after_memory_usage):
             self.log.warning("Unable to detect memory usage (RSS) - skipping memory check.")
@@ -307,10 +311,10 @@ class TestNode():
 
         perc_increase_memory_usage = (after_memory_usage / before_memory_usage) - 1
 
-        if perc_increase_memory_usage > perc_increase_allowed:
+        if perc_increase_memory_usage > increase_allowed:
             self._raise_assertion_error(
                 "Memory usage increased over threshold of {:.3f}% from {} to {} ({:.3f}%)".format(
-                    perc_increase_allowed * 100, before_memory_usage, after_memory_usage,
+                    increase_allowed * 100, before_memory_usage, after_memory_usage,
                     perc_increase_memory_usage * 100))
 
     def assert_start_raises_init_error(self, extra_args=None, expected_msg=None, match=ErrorMatch.FULL_TEXT, *args, **kwargs):

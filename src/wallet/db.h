@@ -31,6 +31,8 @@ struct WalletDatabaseFileId {
     bool operator==(const WalletDatabaseFileId& rhs) const;
 };
 
+class BerkeleyDatabase;
+
 class BerkeleyEnvironment
 {
 private:
@@ -43,7 +45,7 @@ private:
 public:
     std::unique_ptr<DbEnv> dbenv;
     std::map<std::string, int> mapFileUseCount;
-    std::map<std::string, Db*> mapDb;
+    std::map<std::string, std::reference_wrapper<BerkeleyDatabase>> m_databases;
     std::unordered_map<std::string, WalletDatabaseFileId> m_fileids;
     std::condition_variable_any m_db_in_use;
 
@@ -54,6 +56,7 @@ public:
     void MakeMock();
     bool IsMock() const { return fMockDb; }
     bool IsInitialized() const { return fDbEnvInit; }
+    bool IsDatabaseLoaded(const std::string& db_filename) const { return m_databases.find(db_filename) != m_databases.end(); }
     fs::path Directory() const { return strPath; }
 
     /**
@@ -95,6 +98,9 @@ public:
     }
 };
 
+/** Return whether a wallet database is currently loaded. */
+bool IsWalletLoaded(const fs::path& wallet_path);
+
 /** Get BerkeleyEnvironment and database filename given a wallet path. */
 BerkeleyEnvironment* GetWalletEnv(const fs::path& wallet_path, std::string& database_filename);
 
@@ -115,10 +121,19 @@ public:
         nUpdateCounter(0), nLastSeen(0), nLastFlushed(0), nLastWalletUpdate(0)
     {
         env = GetWalletEnv(wallet_path, strFile);
+        auto inserted = env->m_databases.emplace(strFile, std::ref(*this));
+        assert(inserted.second);
         if (mock) {
             env->Close();
             env->Reset();
             env->MakeMock();
+        }
+    }
+
+    ~BerkeleyDatabase() {
+        if (env) {
+            size_t erased = env->m_databases.erase(strFile);
+            assert(erased == 1);
         }
     }
 
@@ -161,6 +176,9 @@ public:
     unsigned int nLastFlushed;
     int64_t nLastWalletUpdate;
 
+    /** Database pointer. This is initialized lazily and reset during flushes, so it can be null. */
+    std::unique_ptr<Db> m_db;
+
 private:
     /** BerkeleyDB specific */
     BerkeleyEnvironment *env;
@@ -173,10 +191,29 @@ private:
     bool IsDummy() { return env == nullptr; }
 };
 
-
 /** RAII class that provides access to a Berkeley database */
 class BerkeleyBatch
 {
+    /** RAII class that automatically cleanses its data on destruction */
+    class SafeDbt final
+    {
+        Dbt m_dbt;
+
+    public:
+        // construct Dbt with internally-managed data
+        SafeDbt();
+        // construct Dbt with provided data
+        SafeDbt(void* data, size_t size);
+        ~SafeDbt();
+
+        // delegate to Dbt
+        const void* get_data() const;
+        u_int32_t get_size() const;
+
+        // conversion operator to access the underlying Dbt
+        operator Dbt*();
+    };
+
 protected:
     Db* pdb;
     std::string strFile;
@@ -204,7 +241,6 @@ public:
     /* verifies the database file */
     static bool VerifyDatabaseFile(const fs::path& file_path, std::string& warningStr, std::string& errorStr, BerkeleyEnvironment::recoverFunc_type recoverFunc);
 
-public:
     template <typename K, typename T>
     bool Read(const K& key, T& value)
     {
@@ -215,13 +251,11 @@ public:
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(1000);
         ssKey << key;
-        Dbt datKey(ssKey.data(), ssKey.size());
+        SafeDbt datKey(ssKey.data(), ssKey.size());
 
         // Read
-        Dbt datValue;
-        datValue.set_flags(DB_DBT_MALLOC);
-        int ret = pdb->get(activeTxn, &datKey, &datValue, 0);
-        memory_cleanse(datKey.get_data(), datKey.get_size());
+        SafeDbt datValue;
+        int ret = pdb->get(activeTxn, datKey, datValue, 0);
         bool success = false;
         if (datValue.get_data() != nullptr) {
             // Unserialize value
@@ -232,10 +266,6 @@ public:
             } catch (const std::exception&) {
                 // In this case success remains 'false'
             }
-
-            // Clear and free memory
-            memory_cleanse(datValue.get_data(), datValue.get_size());
-            free(datValue.get_data());
         }
         return ret == 0 && success;
     }
@@ -252,20 +282,16 @@ public:
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(1000);
         ssKey << key;
-        Dbt datKey(ssKey.data(), ssKey.size());
+        SafeDbt datKey(ssKey.data(), ssKey.size());
 
         // Value
         CDataStream ssValue(SER_DISK, CLIENT_VERSION);
         ssValue.reserve(10000);
         ssValue << value;
-        Dbt datValue(ssValue.data(), ssValue.size());
+        SafeDbt datValue(ssValue.data(), ssValue.size());
 
         // Write
-        int ret = pdb->put(activeTxn, &datKey, &datValue, (fOverwrite ? 0 : DB_NOOVERWRITE));
-
-        // Clear memory in case it was a private key
-        memory_cleanse(datKey.get_data(), datKey.get_size());
-        memory_cleanse(datValue.get_data(), datValue.get_size());
+        int ret = pdb->put(activeTxn, datKey, datValue, (fOverwrite ? 0 : DB_NOOVERWRITE));
         return (ret == 0);
     }
 
@@ -281,13 +307,10 @@ public:
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(1000);
         ssKey << key;
-        Dbt datKey(ssKey.data(), ssKey.size());
+        SafeDbt datKey(ssKey.data(), ssKey.size());
 
         // Erase
-        int ret = pdb->del(activeTxn, &datKey, 0);
-
-        // Clear memory
-        memory_cleanse(datKey.get_data(), datKey.get_size());
+        int ret = pdb->del(activeTxn, datKey, 0);
         return (ret == 0 || ret == DB_NOTFOUND);
     }
 
@@ -301,13 +324,10 @@ public:
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(1000);
         ssKey << key;
-        Dbt datKey(ssKey.data(), ssKey.size());
+        SafeDbt datKey(ssKey.data(), ssKey.size());
 
         // Exists
-        int ret = pdb->exists(activeTxn, &datKey, 0);
-
-        // Clear memory
-        memory_cleanse(datKey.get_data(), datKey.get_size());
+        int ret = pdb->exists(activeTxn, datKey, 0);
         return (ret == 0);
     }
 
@@ -322,20 +342,12 @@ public:
         return pcursor;
     }
 
-    int ReadAtCursor(Dbc* pcursor, CDataStream& ssKey, CDataStream& ssValue, bool setRange = false)
+    int ReadAtCursor(Dbc* pcursor, CDataStream& ssKey, CDataStream& ssValue)
     {
         // Read at cursor
-        Dbt datKey;
-        unsigned int fFlags = DB_NEXT;
-        if (setRange) {
-            datKey.set_data(ssKey.data());
-            datKey.set_size(ssKey.size());
-            fFlags = DB_SET_RANGE;
-        }
-        Dbt datValue;
-        datKey.set_flags(DB_DBT_MALLOC);
-        datValue.set_flags(DB_DBT_MALLOC);
-        int ret = pcursor->get(&datKey, &datValue, fFlags);
+        SafeDbt datKey;
+        SafeDbt datValue;
+        int ret = pcursor->get(datKey, datValue, DB_NEXT);
         if (ret != 0)
             return ret;
         else if (datKey.get_data() == nullptr || datValue.get_data() == nullptr)
@@ -348,16 +360,9 @@ public:
         ssValue.SetType(SER_DISK);
         ssValue.clear();
         ssValue.write((char*)datValue.get_data(), datValue.get_size());
-
-        // Clear and free memory
-        memory_cleanse(datKey.get_data(), datKey.get_size());
-        memory_cleanse(datValue.get_data(), datValue.get_size());
-        free(datKey.get_data());
-        free(datValue.get_data());
         return 0;
     }
 
-public:
     bool TxnBegin()
     {
         if (!pdb || activeTxn)
